@@ -1,5 +1,5 @@
-import { endOfMonth, format, isWithinInterval, parseISO, startOfMonth } from 'date-fns';
-import { workingDaysInMonth } from './date.js';
+import { eachDayOfInterval, endOfMonth, endOfWeek, format, isAfter, isWithinInterval, parseISO, startOfMonth, startOfWeek } from 'date-fns';
+import { isConfiguredWorkingDay, workingDaysInMonth } from './date.js';
 
 const MS_PER_HOUR = 1000 * 60 * 60;
 
@@ -71,9 +71,78 @@ export function calculateMonth(attendance, settings, date = new Date()) {
   };
 }
 
-export function liveEarnings(startedAt, pausedMs, settings) {
+function recordHours(record) {
+  if (!record) return 0;
+  if (Number.isFinite(record.activeHours)) return record.activeHours;
+  return (record.sessions ?? []).reduce((sum, session) => sum + sessionHours(session), 0);
+}
+
+function periodDays(period, date) {
+  if (period === 'week') {
+    return { start: startOfWeek(date, { weekStartsOn: 1 }), end: endOfWeek(date, { weekStartsOn: 1 }) };
+  }
+
+  return { start: startOfMonth(date), end: endOfMonth(date) };
+}
+
+export function calculateWorkProgress(attendance, settings, period = 'week', date = new Date()) {
+  const range = periodDays(period, date);
+  const records = new Map(
+    attendance
+      .filter((day) => isWithinInterval(parseISO(day.date), range))
+      .map((day) => [day.date, day]),
+  );
+  const requiredDays = eachDayOfInterval(range).filter((day) => isConfiguredWorkingDay(day, settings));
+  const requiredKeys = requiredDays.map((day) => format(day, 'yyyy-MM-dd'));
+  const requiredKeySet = new Set(requiredKeys);
+  const requiredHours = settings.requiredDailyHours;
+  const baseTargetHours = requiredDays.length * requiredHours;
+  let requiredWorkedHours = 0;
+  let unresolvedDeficitHours = 0;
+
+  requiredDays.forEach((day) => {
+    const key = format(day, 'yyyy-MM-dd');
+    const hours = recordHours(records.get(key));
+    requiredWorkedHours += Math.min(hours, requiredHours);
+
+    if (!isAfter(day, date)) {
+      unresolvedDeficitHours += Math.max(requiredHours - hours, 0);
+    }
+  });
+
+  const nonRequiredHours = [...records.values()].reduce((sum, record) => {
+    if (requiredKeySet.has(record.date)) return sum;
+    return sum + recordHours(record);
+  }, 0);
+  const deficitFillHours = Math.min(nonRequiredHours, unresolvedDeficitHours);
+  const overtimeHours = Math.max(nonRequiredHours - unresolvedDeficitHours, 0)
+    + [...records.values()].reduce((sum, record) => {
+      if (!requiredKeySet.has(record.date)) return sum;
+      return sum + Math.max(recordHours(record) - requiredHours, 0);
+    }, 0);
+  const adjustedTargetHours = Math.max(baseTargetHours - Math.max(unresolvedDeficitHours - deficitFillHours, 0), 0);
+  const workedHours = Math.min(requiredWorkedHours + deficitFillHours, adjustedTargetHours);
+  const remainingHours = Math.max(adjustedTargetHours - workedHours, 0);
+  const progress = adjustedTargetHours ? (workedHours / adjustedTargetHours) * 100 : 100;
+
+  return {
+    period,
+    baseTargetHours,
+    adjustedTargetHours,
+    workedHours,
+    remainingHours,
+    progress,
+    overtimeHours,
+    unresolvedDeficitHours: Math.max(unresolvedDeficitHours - deficitFillHours, 0),
+    deficitFillHours,
+    requiredDays: requiredDays.length,
+  };
+}
+
+export function liveEarnings(startedAt, pausedMs, settings, pausedAt = null) {
   if (!startedAt) return { elapsedMs: 0, activeHours: 0, earnings: 0, remainingHours: settings.requiredDailyHours };
-  const elapsedMs = Math.max(Date.now() - new Date(startedAt).getTime() - pausedMs, 0);
+  const currentTime = pausedAt ? new Date(pausedAt).getTime() : Date.now();
+  const elapsedMs = Math.max(currentTime - new Date(startedAt).getTime() - pausedMs, 0);
   const activeHours = elapsedMs / MS_PER_HOUR;
   const rates = salaryRates(settings);
   const baseHours = Math.min(activeHours, settings.requiredDailyHours);
